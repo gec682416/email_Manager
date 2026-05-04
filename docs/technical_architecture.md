@@ -78,8 +78,8 @@ MVP 必须做：
 MVP 暂不建议做：
 
 - 自动发送邮件。
-- 自动删除邮件。
-- 自动移动邮件。
+- 自动删除邮箱服务器上的邮件。
+- 自动移动邮箱服务器上的邮件文件夹。
 - 未确认时直接写入外部日历。
 - 复杂多 Agent 并行调度。
 - 企业级团队权限。
@@ -90,14 +90,14 @@ MVP 暂不建议做：
 以下动作必须默认禁止自动执行：
 
 - 自动发送邮件。
-- 删除邮件。
-- 移动邮件文件夹。
+- 删除邮箱服务器上的邮件。
+- 移动邮箱服务器上的邮件文件夹。
 - 批量标记已读。
 - 未经确认写入外部日历。
 - 修改或取消已有外部日历事件。
 - 将邮件内容转发给第三方系统。
 
-这些能力可以作为未来功能存在，但必须由 Permission Manager 控制，并要求用户明确确认。
+第一版只允许删除本系统本地保存的邮件副本或本地解析结果，不允许删除网易邮箱服务器上的邮件。服务器侧删除、移动、标记已读等能力即使后续加入，也必须由 Permission Manager 控制，并要求用户明确确认。
 
 ## 3. 总体架构
 
@@ -120,13 +120,10 @@ Agent Orchestrator
       |
       +---------------- Tool Registry
       |                       |
-      |                       +-- IMAP Tools
-      |                       +-- Email Parser Tools
-      |                       +-- Classification Tools
-      |                       +-- Extraction Tools
-      |                       +-- Calendar Tools
-      |                       +-- Task Tools
-      |                       +-- Notification Tools
+      |                       +-- Mail Query Tools
+      |                       +-- Calendar File Tools
+      |                       +-- File Tools
+      |                       +-- Time Tools
       |                       +-- Search Tools
       |                       +-- Memory Tools
       |
@@ -137,6 +134,11 @@ Queue / Scheduler
 Workers
       |
       +---------------- mysql
+      +---------------- redis
+      +---------------- rabbitmq
+      +---------------- chroma
+      +---------------- local file storage
+      +---------------- Alibaba Bailian Qwen
 ```
 
 ### 3.2 核心设计原则
@@ -155,11 +157,11 @@ Workers
 
 4. 高风险动作必须显式确认。
 
-   读邮件、生成摘要、生成草稿可以自动执行；发送邮件、写外部日历、删除邮件必须确认。
+   读本地数据库中的邮件、查询事件、生成摘要、生成草稿可以自动执行；发送邮件、写外部日历、删除邮箱服务器邮件必须确认。第一版不实现服务器侧删除。
 
 5. 原文保留，模型上下文使用投影视图。
 
-   完整邮件原文保存在数据库或对象存储中，模型只看到当前任务必要的摘要、结构化字段和引用 ID。
+   完整邮件原文在本系统中保存 14 天，模型只看到当前任务必要的摘要、结构化字段和引用 ID。14 天后可以删除本地原文和附件副本，但不能删除网易邮箱服务器上的邮件。
 
 6. Agent 负责决策编排，工具负责确定性执行。
 
@@ -171,30 +173,32 @@ Workers
 如果从零开始，推荐：
 
 ```text
-Backend: python
-API Framework: fastapi
-Queue: rabbitmq
+Backend: Python
+API Framework: FastAPI
+Queue / Broker: RabbitMQ
 Cache / Lock: Redis
-Database: mysql
-Vector Search: chroma、
-LLM: OpenAI / Claude / 可插拔 LLM Provider
+Database: MySQL
+Vector Search: Chroma
+LLM: 阿里百炼平台 Qwen
 Frontend: React / Next.js
-Deployment: Docker Compose MVP，后续云服务部署
+Deployment: 本地 Docker Compose 部署，后续再考虑云服务部署
 ```
 
 
-### 4.3 中间件选择
+### 4.1 中间件选择
 
 MVP 必要：
 
-- mysql：业务数据主存储。
-- Redis：队列依赖、缓存、分布式锁、同步状态。
-- rabbitmq：异步任务队列。
+- MySQL：业务数据主存储。
+- Redis：缓存、分布式锁、同步状态、短期会话状态。
+- RabbitMQ：异步任务队列与后台 worker 解耦。
+- Chroma：邮件、事件、memory 的语义检索。
+- 本地文件存储：MVP 保存 14 天原始邮件、HTML、附件和 JSONL 日志。
+- 阿里百炼 Qwen：邮件分类、事件抽取、摘要、对话推理。
 - 结构化日志：排查 agent 决策与工具执行问题。
 
 后续增强：
 
-- pgvector：邮件语义搜索。
 - OpenTelemetry：跨服务链路追踪。
 - MinIO / S3：附件和原始邮件持久化。
 - KMS / Vault：生产级密钥管理。
@@ -205,7 +209,7 @@ MVP 必要：
 - Kafka。
 - Elasticsearch。
 - Kubernetes。
-- 独立向量数据库。
+- Milvus / Pinecone 等重型独立向量数据库。
 - 复杂多 Agent 平台。
 
 ## 5. 系统模块设计
@@ -247,17 +251,18 @@ POST   /api/actions/:id/reject
 
 ### 5.2 Agent Orchestrator
 
-Agent Orchestrator 是系统的 Agent Runtime。它不直接负责 IMAP、数据库或日历写入，而是负责任务规划、工具选择、上下文组装、权限判断和状态落库。
+Agent Orchestrator 是系统的 Agent Runtime。它不直接负责 IMAP 原始同步、MIME 解析、批量分类或批量抽取，这些工作由后台 worker 定时完成。主 Agent 的重点是根据用户问题查询数据库中的结构化邮件、事件、任务和 memory，然后进行推理、解释、确认动作和生成回答。
 
 核心职责：
 
-- 接收用户自然语言请求或后台任务请求。
+- 接收用户自然语言请求。
 - 读取相关上下文。
 - 选择和调用工具。
 - 合并工具结果。
 - 维护本轮 Agent 状态。
 - 生成面向用户的回答或待确认动作。
 - 记录 agent run 和 tool call。
+- 在需要时触发“快速刷新邮箱”后台任务，但不在交互请求中阻塞等待全量同步。
 
 Agent Orchestrator 应采用单写者原则：
 
@@ -272,7 +277,17 @@ Agent Orchestrator 应采用单写者原则：
 
 ### 5.3 Tool Registry
 
-Tool Registry 负责注册系统可用工具，并描述每个工具的能力边界。
+Tool Registry 负责注册主 Agent 可调用的工具，并描述每个工具的能力边界。需要区分两类能力：
+
+```text
+主 Agent 工具:
+  用户提问时可调用，例如查询某类邮件、查询事件、读取当前时间、读写本地日历文件、读取 memory。
+
+后台 worker 内部服务:
+  定时或异步执行，例如 IMAP 同步、MIME 解析、邮件分类、事件抽取、任务抽取。
+```
+
+解析、分类、抽取不需要暴露为主 Agent 的常规工具。它们应作为后台流水线执行，结果写入 MySQL。主 Agent 查询这些结果即可。
 
 每个工具应包含：
 
@@ -294,9 +309,18 @@ handler
 示例：
 
 ```yaml
-name: calendar.create_event
-risk_level: high
-requires_confirmation: true
+name: mail.query_by_category
+risk_level: low
+requires_confirmation: false
+is_concurrency_safe: true
+timeout_ms: 5000
+max_output_chars: 8000
+```
+
+```yaml
+name: calendar_file.update
+risk_level: medium
+requires_confirmation: false
 is_concurrency_safe: false
 timeout_ms: 10000
 max_output_chars: 4000
@@ -325,23 +349,26 @@ Permission Manager 控制工具是否可以执行。
 low:
   - 读取数据库中的邮件元数据
   - 读取已同步邮件正文
-  - 分类
+  - 查询已分类邮件
   - 摘要
-  - 事件抽取
+  - 查询已抽取事件
   - 冲突检测
+  - 读取当前时间
+  - 读取本地文件
 
 medium:
   - 创建内部事件草稿
   - 创建内部任务
   - 生成回复草稿
   - 标记内部状态
+  - 写入或更新本地日历文件
 
 high:
   - 写入外部日历
   - 发送邮件
   - 修改邮件状态
   - 移动邮件
-  - 删除邮件
+  - 删除邮箱服务器上的邮件
   - 同步到第三方任务系统
 ```
 
@@ -350,7 +377,8 @@ high:
 - low 可以自动执行。
 - medium 可以自动生成草稿，但应可撤销。
 - high 必须用户确认。
-- delete / send / external write 永远不能静默执行。
+- server-side delete / send / external write 永远不能静默执行。
+- 第一版本地删除只删除本系统保存的原文、附件或解析结果，不删除网易邮箱服务器邮件。
 
 ### 5.5 Context Manager
 
@@ -470,6 +498,16 @@ classify_email(email_id)
   -> enqueue extraction tasks based on category
 ```
 
+邮件分类可以并发执行。分类任务的输入是单封邮件的解析结果，输出写入该邮件自己的 email_classifications 记录；两封邮件谁先完成分类不会影响业务语义。因此 email.classify worker 应支持多 worker 并发消费 RabbitMQ 队列。
+
+并发执行约束：
+
+- 同一个 email_id + prompt_version 只能有一个有效分类结果。
+- classify_email job 必须幂等，重复执行时覆盖同版本结果或直接跳过。
+- 并发数需要受 Qwen API 限流、成本预算和机器资源约束。
+- 分类完成后可以立即触发该邮件自己的事件/任务抽取，不需要等待同批次其他邮件分类完成。
+- 分类任务不能直接修改邮箱服务器状态。
+
 分类标签建议：
 
 ```text
@@ -567,7 +605,7 @@ API Server
   -> Agent Orchestrator
   -> check last sync time
   -> if stale, enqueue quick sync or offer refresh
-  -> query structured events from DB
+  -> query classified emails / structured events from DB
   -> retrieve related email snippets
   -> build compact context
   -> LLM generates answer
@@ -579,40 +617,45 @@ API Server
 
 - 优先查结构化事件表。
 - 不应直接把所有邮件塞给模型。
+- 主 Agent 默认只调用查询类工具，例如按类别、时间范围、状态获取邮件或事件。
 - 如果最近同步时间太旧，可以先提示“最近同步于 xx，是否刷新”或后台触发快速同步。
 
-### 6.7 用户确认写入外部日历流程
+### 6.7 用户确认内部日历事件流程
 
 ```text
 User clicks confirm
   -> create pending action
-  -> Permission Manager validates high-risk action
-  -> Calendar Tool creates external event
-  -> store external_calendar_event_id
+  -> Permission Manager validates action
   -> mark internal event confirmed
+  -> update internal calendar view
+  -> optionally update local internal_calendar.ics / internal_calendar.json
   -> audit log
 ```
 
 必须保证：
 
-- 同一个 event_id 重复确认不会创建多个外部日历。
+- 同一个 event_id 重复确认不会创建重复内部事件。
 - 使用 idempotency key。
-- 外部写入失败时内部状态不能误标为已完成。
+- 本地日历文件更新失败时，数据库事件状态不能被误标为文件已同步。
 - 用户能看到来源邮件和将要写入的内容。
+
+外部日历写入属于后续版本。接入飞书、Google Calendar 或 Outlook Calendar 后，应额外增加 external_calendar_events 表、Pending Action 和更严格的用户确认流程。
 
 ## 7. 工具系统详细设计
 
 ### 7.1 工具分类
 
-工具分为以下几类：
+工具需要分成“主 Agent 可调用工具”和“后台 worker 内部服务”两层。这样可以避免主 Agent 直接暴露过多底层能力，也能让交互链路更稳定。
+
+主 Agent 可调用工具：
 
 ```text
-Mail Connector Tools
-Email Parsing Tools
-Classification Tools
-Extraction Tools
-Calendar Tools
-Task Tools
+Mail Query Tools
+Event Query Tools
+Task Query Tools
+Time Tools
+File Tools
+Calendar File Tools
 Search Tools
 Memory Tools
 Notification Tools
@@ -620,21 +663,44 @@ Audit Tools
 User Confirmation Tools
 ```
 
-### 7.2 Mail Connector Tools
+后台 worker 内部服务：
 
-#### imap.sync_mailbox
+```text
+IMAP Sync Service
+Email Parse Service
+Email Classification Service
+Event Extraction Service
+Task Extraction Service
+Conflict Detection Service
+Embedding Service
+Memory Extraction Subagent
+```
+
+设计原则：
+
+- 主 Agent 不直接调用 `email.parse_mime`、`email.classify`、`event.extract_from_email` 这类底层处理工具。
+- 这些底层能力由 RabbitMQ 后台任务触发，结果写入 MySQL。
+- 主 Agent 用户提问时主要调用数据库查询类工具，例如按类别取邮件、按时间取事件、按状态取任务。
+- 只有当用户明确要求刷新邮箱时，主 Agent 可以触发一次轻量同步任务，但不应在交互链路中执行长时间 IMAP 全量同步。
+
+### 7.2 Mail Query Tools
+
+#### mail.query_by_category
 
 用途：
 
-同步指定邮箱的新邮件。
+按分类、时间范围、状态查询已经入库并分类的邮件。这是主 Agent 最常用的邮件工具。
 
 输入：
 
 ```json
 {
-  "account_id": "string",
-  "mode": "delta | full | recent",
-  "since": "ISO datetime optional"
+  "categories": ["interview", "written_test"],
+  "start_time": "2026-05-04T00:00:00+08:00",
+  "end_time": "2026-05-11T00:00:00+08:00",
+  "status": "processed | needs_review | all",
+  "limit": 20,
+  "include_snippet": true
 }
 ```
 
@@ -642,11 +708,96 @@ User Confirmation Tools
 
 ```json
 {
+  "emails": [
+    {
+      "email_id": "email_123",
+      "category": "interview",
+      "subject": "面试邀请",
+      "from_email": "hr@example.com",
+      "received_at": "2026-05-04T09:20:00+08:00",
+      "snippet": "请参加 5 月 6 日下午两点的技术面试...",
+      "classification_confidence": 0.94
+    }
+  ],
+  "truncated": false
+}
+```
+
+权限：
+
+```text
+risk_level: low
+requires_confirmation: false
+is_concurrency_safe: true
+```
+
+说明：
+
+- 该工具只读 MySQL，不访问邮箱服务器。
+- 输出只返回摘要和必要字段，默认不返回完整原文。
+- 用户问“我这周有哪些面试”“最近有没有笔试”时优先调用该工具。
+
+#### mail.get_detail
+
+用途：
+
+读取某封邮件的详情。默认返回解析后的 clean_text 片段和来源信息；只有必要时才读取完整本地原文。
+
+输入：
+
+```json
+{
+  "email_id": "string",
+  "include_body": true,
+  "include_raw": false,
+  "max_chars": 12000
+}
+```
+
+输出：
+
+```json
+{
+  "email_id": "string",
+  "subject": "string",
+  "from_email": "string",
+  "sent_at": "ISO datetime",
+  "category": "interview",
+  "clean_text": "string",
+  "truncated": true,
+  "full_content_ref": "local-storage-path"
+}
+```
+
+权限：
+
+```text
+risk_level: low
+requires_confirmation: false
+is_concurrency_safe: true
+```
+
+#### mail.trigger_quick_sync
+
+用途：
+
+用户明确要求刷新时，触发某个邮箱的增量同步后台任务。
+
+输入：
+
+```json
+{
   "account_id": "string",
-  "new_email_ids": ["string"],
-  "updated_email_ids": ["string"],
-  "sync_cursor": "string",
-  "errors": []
+  "reason": "user_requested_refresh"
+}
+```
+
+输出：
+
+```json
+{
+  "job_id": "job_123",
+  "status": "queued"
 }
 ```
 
@@ -660,23 +811,25 @@ is_concurrency_safe: false per mailbox
 
 说明：
 
-- 该工具可以自动运行。
-- 对同一个 account_id 必须加锁。
-- 不允许修改用户邮箱状态，除非显式工具支持。
+- 工具只负责入队，不在主 Agent 对话中阻塞等待长任务完成。
+- 同一邮箱必须用 Redis lock 防止重复同步。
 
-#### imap.fetch_email_body
+### 7.3 Event / Task Query Tools
+
+#### event.query
 
 用途：
 
-按 email_id 获取完整正文或指定片段。
+按时间范围、事件类型、状态查询已抽取的内部事件。
 
 输入：
 
 ```json
 {
-  "email_id": "string",
-  "part": "text | html | raw | headers",
-  "max_chars": 12000
+  "event_types": ["interview", "written_test", "meeting"],
+  "start_time": "2026-05-04T00:00:00+08:00",
+  "end_time": "2026-05-11T00:00:00+08:00",
+  "status": "draft | confirmed | conflict | needs_review | all"
 }
 ```
 
@@ -684,10 +837,51 @@ is_concurrency_safe: false per mailbox
 
 ```json
 {
-  "email_id": "string",
-  "content": "string",
-  "truncated": true,
-  "full_content_ref": "object-storage-path"
+  "events": [
+    {
+      "event_id": "event_123",
+      "title": "某公司技术一面",
+      "event_type": "interview",
+      "start_time": "2026-05-06T14:00:00+08:00",
+      "end_time": "2026-05-06T15:00:00+08:00",
+      "status": "draft",
+      "source_email_id": "email_123",
+      "confidence": 0.91
+    }
+  ]
+}
+```
+
+#### task.query
+
+用途：
+
+按状态、截止时间、优先级查询待办事项。
+
+### 7.4 Time Tools
+
+#### time.now
+
+用途：
+
+提供当前系统时间、用户默认时区时间和 UTC 时间。主 Agent 在回答“今天”“明天”“这周”这类问题时必须使用该工具或请求上下文中注入的当前时间，不能凭模型内部日期猜测。
+
+输入：
+
+```json
+{
+  "timezone": "Asia/Singapore"
+}
+```
+
+输出：
+
+```json
+{
+  "now_utc": "2026-05-04T08:30:00Z",
+  "now_local": "2026-05-04T16:30:00+08:00",
+  "timezone": "Asia/Singapore",
+  "weekday": "Monday"
 }
 ```
 
@@ -699,173 +893,11 @@ requires_confirmation: false
 is_concurrency_safe: true
 ```
 
-#### smtp.send_email
-
-用途：
-
-发送邮件。
-
-权限：
-
-```text
-risk_level: high
-requires_confirmation: true
-is_concurrency_safe: false
-```
-
-MVP 默认不启用自动发送，只允许创建草稿。
-
-### 7.3 Email Parsing Tools
-
-#### email.parse_mime
-
-用途：
-
-将 MIME 解析为 headers、text、html、attachments。
-
-输出：
-
-```json
-{
-  "subject": "string",
-  "from": "string",
-  "to": ["string"],
-  "cc": ["string"],
-  "sent_at": "ISO datetime",
-  "text_body_ref": "string",
-  "html_body_ref": "string",
-  "attachments": []
-}
-```
-
-#### email.extract_links
-
-用途：
-
-从正文中提取链接。
-
-链接类型：
-
-```text
-meeting_link
-assessment_link
-calendar_invite
-form_link
-attachment_download
-generic
-```
-
-### 7.4 Classification Tools
-
-#### email.classify
-
-用途：
-
-给邮件打业务分类。
-
-输入：
-
-```json
-{
-  "email_id": "string",
-  "subject": "string",
-  "sender": "string",
-  "snippet": "string",
-  "links": []
-}
-```
-
-输出：
-
-```json
-{
-  "category": "interview",
-  "confidence": 0.92,
-  "reason": "邮件包含面试邀请、具体日期和会议链接。",
-  "evidence": ["面试时间", "腾讯会议"]
-}
-```
-
-实现策略：
-
-1. 规则预分类：
-   - 标题包含“面试”“笔试”“测评”“interview”“assessment”等关键词。
-   - 发件人域名与公司或招聘系统相关。
-2. LLM 分类：
-   - 对规则不确定的邮件调用模型。
-3. 结果落库：
-   - 保存 prompt_version 和 model_name。
-
-### 7.5 Extraction Tools
-
-#### event.extract_from_email
-
-用途：
-
-从邮件中抽取一个或多个日程事件。
-
-输出 schema：
-
-```json
-{
-  "events": [
-    {
-      "title": "string",
-      "event_type": "interview | written_test | meeting | deadline",
-      "start_time": "ISO datetime or null",
-      "end_time": "ISO datetime or null",
-      "timezone": "Asia/Shanghai",
-      "location": "string or null",
-      "meeting_link": "string or null",
-      "company": "string or null",
-      "contact_name": "string or null",
-      "contact_email": "string or null",
-      "confidence": 0.0,
-      "missing_fields": ["end_time"],
-      "evidence": ["string"]
-    }
-  ]
-}
-```
-
-设计要求：
-
-- 必须输出 evidence。
-- 时间不确定不能强行编造。
-- 时区不明确要标记 timezone_uncertain。
-- 多个候选时间要全部返回并标记需要用户确认。
-
-#### task.extract_from_email
-
-用途：
-
-提取待办事项。
-
-输出 schema：
-
-```json
-{
-  "tasks": [
-    {
-      "title": "string",
-      "description": "string",
-      "due_at": "ISO datetime or null",
-      "priority": "low | medium | high",
-      "assignee": "self | other | unknown",
-      "confidence": 0.0,
-      "evidence": ["string"]
-    }
-  ]
-}
-```
-
-### 7.6 Time Tools
-
 #### time.normalize
 
 用途：
 
-将自然语言时间转换为标准时间。
+将自然语言时间转换为标准时间。该工具主要供后台事件抽取 worker 使用，主 Agent 在用户临时要求解析时间时也可以调用。
 
 输入：
 
@@ -887,7 +919,7 @@ generic
   "timezone": "Asia/Singapore",
   "confidence": 0.86,
   "ambiguous": false,
-  "reason": "根据 reference_time 解析下周三。"
+  "reason": "根据 email_sent_at 解析下周三。"
 }
 ```
 
@@ -899,63 +931,190 @@ generic
 - 对“明天”“下周三”必须基于 email_sent_at，而不是当前系统时间。
 - 对无年份日期要根据邮件发送时间推断年份。
 
-### 7.7 Calendar Tools
+### 7.5 File Tools
 
-#### calendar.create_internal_draft
+基础文件工具用于读写本系统工作目录内的本地文件，例如内部日历导出文件、调试报告、JSONL 日志片段等。
+
+#### file.read
 
 用途：
 
-创建内部日历草稿。
+读取本地允许目录内的文件内容。
+
+输入：
+
+```json
+{
+  "path": "calendar/internal_calendar.ics",
+  "max_chars": 20000
+}
+```
+
+输出：
+
+```json
+{
+  "path": "calendar/internal_calendar.ics",
+  "content": "string",
+  "truncated": false
+}
+```
+
+权限：
+
+```text
+risk_level: low
+requires_confirmation: false
+is_concurrency_safe: true
+```
+
+#### file.write
+
+用途：
+
+写入本地允许目录内的文件。该工具不能写任意系统路径，只能写应用配置允许的目录，例如 `data/exports`、`data/calendars`、`data/agent-runs`。
+
+输入：
+
+```json
+{
+  "path": "calendar/internal_calendar.ics",
+  "content": "string",
+  "mode": "overwrite | append",
+  "idempotency_key": "string"
+}
+```
+
+权限：
+
+```text
+risk_level: medium
+requires_confirmation: false for allowed app files
+is_concurrency_safe: false
+```
+
+说明：
+
+- 写入必须是原子操作：先写临时文件，再 rename。
+- 对 JSONL 日志使用 append-only。
+- 对日历文件使用结构化更新工具优先，不建议让 Agent 拼接字符串。
+
+### 7.6 Calendar File Tools
+
+#### calendar_file.upsert_event
+
+用途：
+
+更新内部日历文件。例如已经生成 `internal_calendar.ics` 或 `internal_calendar.json` 后，后续又来了一封新的会议邮件，可以把新事件合并进现有文件，而不是重建整个文件。
+
+输入：
+
+```json
+{
+  "calendar_file_path": "data/calendars/internal_calendar.ics",
+  "event_id": "event_123",
+  "title": "某公司技术一面",
+  "start_time": "2026-05-06T14:00:00+08:00",
+  "end_time": "2026-05-06T15:00:00+08:00",
+  "timezone": "Asia/Singapore",
+  "location": "腾讯会议",
+  "description": "来源邮件 email_123",
+  "source_email_id": "email_123"
+}
+```
+
+输出：
+
+```json
+{
+  "calendar_file_path": "data/calendars/internal_calendar.ics",
+  "operation": "created | updated",
+  "event_id": "event_123"
+}
+```
 
 权限：
 
 ```text
 risk_level: medium
 requires_confirmation: false
-```
-
-#### calendar.write_external_event
-
-用途：
-
-写入 Google Calendar、飞书 Calendar、Outlook Calendar 等外部日历。
-
-权限：
-
-```text
-risk_level: high
-requires_confirmation: true
-```
-
-输入：
-
-```json
-{
-  "event_id": "string",
-  "calendar_account_id": "string",
-  "title": "string",
-  "start_time": "ISO datetime",
-  "end_time": "ISO datetime",
-  "location": "string",
-  "description": "string",
-  "reminders": []
-}
+is_concurrency_safe: false
 ```
 
 幂等要求：
 
-- idempotency key = user_id + event_id + calendar_account_id。
-- 如果 external_event_id 已存在，应执行更新而不是重复创建。
+- `event_id` 是日历文件中的稳定 UID。
+- 同一个 `event_id` 重复写入应更新原事件，不应创建重复事件。
+- 文件更新必须加锁，避免多个 worker 同时写坏日历文件。
+
+#### calendar_file.remove_event
+
+用途：
+
+从本地内部日历文件中删除某个事件。只影响本系统本地文件，不影响外部日历。
+
+权限：
+
+```text
+risk_level: medium
+requires_confirmation: false if local only
+is_concurrency_safe: false
+```
+
+### 7.7 Background Pipeline Internal Services
+
+以下能力不作为主 Agent 常规工具暴露，而是由后台 worker 消费 RabbitMQ 任务执行。
+
+#### imap.sync_mailbox
+
+```text
+用途: 同步网易邮箱新邮件。
+并发: 同一个 mailbox 不并发，不同 mailbox 可以并发。
+写入: email_messages、email_parsed_contents 的前置原文数据。
+```
+
+#### email.parse_mime
+
+```text
+用途: 解析 MIME、HTML、附件、链接。
+并发: 不同 email_id 可以并发。
+写入: email_parsed_contents、attachments。
+```
+
+#### email.classify
+
+```text
+用途: 邮件分类。
+并发: 并发安全，不同 email_id 可以并发分类。
+写入: email_classifications。
+约束: 同一个 email_id + prompt_version 幂等。
+```
+
+#### event.extract_from_email
+
+```text
+用途: 从已分类邮件中抽取事件。
+并发: 不同 email_id 可以并发；写同一个 event dedupe_key 时需要幂等。
+写入: extracted_events。
+```
+
+#### task.extract_from_email
+
+```text
+用途: 从邮件中抽取待办事项。
+并发: 不同 email_id 可以并发。
+写入: tasks。
+```
 
 ### 7.8 Search Tools
 
 #### search.email_keyword
 
-使用 mysqlSQL Full Text Search 做关键词检索。
+使用 MySQL Full Text Index 或 LIKE + 索引做关键词检索。MVP 可以先用简单关键词检索，后续再优化分词和排序。
 
 #### search.email_semantic
 
-使用 chroma 做语义检索。
+使用 Chroma 做语义检索。
 
 #### search.hybrid
 
@@ -971,11 +1130,15 @@ HR 有没有让我准备身份证？
 
 #### memory.read_relevant
 
+用途：
+
 读取与当前问题相关的用户记忆。
 
 #### memory.write_preference
 
-写入用户明确偏好。
+用途：
+
+写入用户明确偏好。自动 memory 抽取由后台 Memory Extraction Subagent 完成，不建议主 Agent 在没有用户确认时直接写长期 memory。
 
 必须限制写入范围：
 
@@ -1011,6 +1174,27 @@ needs_review
 - Telegram。
 
 MVP 可以先只做站内提醒或控制台提醒。
+
+### 7.11 User Confirmation Tools
+
+#### action.create_pending
+
+用途：
+
+为高风险动作或需要用户确认的中风险动作创建待确认记录。
+
+输入：
+
+```json
+{
+  "action_type": "confirm_internal_event | update_calendar_file | send_email | write_external_calendar | delete_server_email",
+  "payload": {},
+  "reason": "string",
+  "source_refs": ["email_123"]
+}
+```
+
+第一版主要用于确认内部事件是否有效；外部日历和邮件发送属于后续扩展。
 
 ## 8. Agent Loop 设计
 
@@ -1049,12 +1233,16 @@ type AgentRunState = {
 concurrency_safe:
   - 读取邮件
   - 查询数据库
-  - 分类
+  - 查询已分类邮件
   - 摘要
   - 搜索
+  - 读取当前时间
+  - 读取本地文件
+  - 后台邮件分类 worker 处理不同 email_id
 
 not_concurrency_safe:
   - 写内部事件
+  - 写本地日历文件
   - 写外部日历
   - 发送邮件
   - 修改同步游标
@@ -1067,6 +1255,8 @@ not_concurrency_safe:
 - unsafe 工具独占执行。
 - 后面的 safe 工具不能越过前面的 unsafe 工具。
 - 会修改上下文的工具结果按原始 tool_use 顺序应用。
+- 邮件分类本身是并发安全的，RabbitMQ 可以同时分发多封邮件给多个 Classification Worker；只要每个 worker 只写自己的 email_id 分类结果，完成顺序不影响主 Agent。
+- 文件写入和日历文件更新不是并发安全的，必须按文件路径加锁。
 
 ### 8.3 Agent Run 类型
 
@@ -1357,12 +1547,45 @@ last_used_at
 
 ### 10.4 Memory 写入策略
 
+Memory 写入分为两条通道。
+
+第一条：用户显式写入。
+
 可以写入：
 
 - 用户明确说“记住”。
 - 用户多次重复设置同一偏好。
 - 用户纠正 Agent 行为。
 - 用户确认某类长期规则。
+
+第二条：后台 Memory Extraction Subagent。
+
+触发条件可以配置为：
+
+```text
+每隔 N 轮对话，例如 8 到 10 轮。
+一次完整 Agent Run 结束后。
+用户明显给出长期偏好但没有使用“记住”关键词。
+session summary 发生较大变化时。
+```
+
+后台抽取方式：
+
+```text
+主 Agent 当前会话
+  -> fork 一个受限 Memory Extraction Subagent
+  -> 读取最近 N 轮对话摘要和已有 memory manifest
+  -> 判断 create / update / archive / noop
+  -> 写入 user_memories
+```
+
+该子 Agent 的权限必须非常窄：
+
+- 只能读取最近对话摘要和已有 memory manifest。
+- 只能写 user_memories。
+- 不能读取完整邮件原文。
+- 不能调用发送邮件、日历写入、IMAP 修改类工具。
+- 不能把临时业务事实写入长期 memory。
 
 不应写入：
 
@@ -1375,18 +1598,18 @@ last_used_at
 
 ### 10.5 Memory 抽取流程
 
-在完整 Agent Run 结束后触发：
+在完整 Agent Run 结束后，或每隔固定轮数触发：
 
 ```text
-agent run completed
-  -> memory extraction job
+agent run completed / turn_count reaches threshold
+  -> fork Memory Extraction Subagent
   -> load recent conversation summary
   -> load existing memory manifest
   -> decide no-op / create / update / archive
   -> write user_memories
 ```
 
-Memory extraction 应有专用 prompt 和严格 schema。
+Memory extraction 应有专用 prompt、严格 schema 和独立 prompt_version。它的目标不是总结所有聊天内容，而是判断哪些信息对未来会话长期有用。
 
 输出：
 
@@ -1473,12 +1696,14 @@ updated_at
 provider:
 
 ```text
+netease
+qq
 gmail
 outlook
-qq
-netease
 custom_imap
 ```
+
+第一版只实现 `netease`，其他 provider 作为后续扩展。
 
 ### 11.3 mailbox_sync_states
 
@@ -1521,6 +1746,8 @@ raw_mime_ref
 html_ref
 text_ref
 body_hash
+raw_retention_until
+local_deleted_at
 has_attachments
 is_read
 is_deleted
@@ -1528,6 +1755,13 @@ sync_status
 created_at
 updated_at
 ```
+
+数据保留策略：
+
+- `raw_mime_ref`、`html_ref`、`text_ref` 指向本系统本地保存的原文或清洗结果。
+- 原文和附件默认保存 14 天，`raw_retention_until` 到期后可以删除本地文件。
+- 删除本系统本地副本时设置 `local_deleted_at`，但不删除网易邮箱服务器上的邮件。
+- 分类、事件、任务、摘要和来源引用可以继续保留，用于历史查询和统计。
 
 唯一约束建议：
 
@@ -1689,6 +1923,8 @@ review
 
 ### 11.13 calendar_accounts
 
+该表用于后续外部日历接入，MVP 内部日历不依赖它。
+
 ```text
 id
 user_id
@@ -1702,6 +1938,8 @@ updated_at
 ```
 
 ### 11.14 external_calendar_events
+
+该表用于后续外部日历接入，MVP 内部日历不依赖它。
 
 ```text
 id
@@ -1797,9 +2035,12 @@ action_type:
 write_calendar_event
 send_email
 update_external_event
-delete_email
+delete_local_email_copy
+delete_server_email
 mark_email_read
 ```
+
+第一版只允许 `delete_local_email_copy`，且只删除本系统保存的本地副本。`delete_server_email` 和 `mark_email_read` 不在 MVP 实现范围内。
 
 ### 11.19 embeddings
 
@@ -1843,6 +2084,27 @@ memory.extract
 agent.background
 ```
 
+RabbitMQ 队列并发建议：
+
+```text
+mail.sync:
+  同一个 mail_account_id 串行，不同账号可并发。
+
+email.parse:
+  不同 email_id 可并发。
+
+email.classify:
+  并发安全，可启动多个 worker 同时消费。
+  并发上限受 Qwen API 限流和成本预算控制。
+
+event.extract / task.extract:
+  不同 email_id 可并发。
+  写入同一 dedupe_key 时必须幂等。
+
+calendar_file.update:
+  按文件路径串行。
+```
+
 ### 12.2 Job 幂等性
 
 每个 job 必须有 idempotency key。
@@ -1855,6 +2117,7 @@ parse_email: email_id + body_hash
 classify_email: email_id + prompt_version
 extract_event: email_id + prompt_version
 embedding: object_type + object_id + content_hash
+calendar_file_update: calendar_file_path + event_id
 ```
 
 ### 12.3 重试策略
@@ -1953,6 +2216,29 @@ KMS / Vault
 - 来源邮件。
 - 风险说明。
 - 确认和拒绝按钮。
+
+### 13.5 邮件数据保留策略
+
+第一版为个人本地使用，但仍然需要明确本地数据生命周期：
+
+```text
+本系统完整保存邮件原文、HTML、附件: 14 天。
+14 天后: 可以删除本地原文、HTML 和附件副本。
+继续保留: 邮件元数据、分类、摘要、事件、任务、来源引用。
+永不执行: 删除网易邮箱服务器上的邮件。
+```
+
+用户在系统里点击“删除邮件”时，第一版语义应为：
+
+```text
+删除本系统本地副本 / 隐藏本系统记录
+```
+
+而不是：
+
+```text
+删除网易邮箱服务器上的邮件
+```
 
 ## 14. 时间与日历设计
 
@@ -2079,7 +2365,7 @@ SQL 查询即可解决。
 HR 发过什么材料要求
 ```
 
-使用 PostgreSQL Full Text Search。
+使用 MySQL Full Text Index。MVP 如果分词和排序要求不高，也可以先用普通索引 + LIKE 实现，后续再引入更好的中文分词方案。
 
 ### 16.3 第三阶段：语义搜索
 
@@ -2091,7 +2377,7 @@ HR 发过什么材料要求
 有哪个公司提到 base 地点？
 ```
 
-使用 pgvector。
+使用 Chroma。
 
 ### 16.4 Hybrid Search
 
@@ -2219,7 +2505,7 @@ queue_lag
 - 事件抽取 precision / recall。
 - 时间解析准确率。
 - 冲突检测准确率。
-- 错误写入外部日历次数。
+- 错误写入内部/外部日历次数。
 - 需要人工 review 的比例。
 
 ### 18.4 回放机制
@@ -2229,6 +2515,8 @@ queue_lag
 ```text
 agent_runs/{run_id}.jsonl
 ```
+
+JSONL 文件采用 append-only 方式写入。每产生一个对话事件、工具调用事件、工具结果事件或模型输出事件，就追加一行 JSON。不要反复重写整个日志文件。
 
 内容：
 
@@ -2252,6 +2540,15 @@ agent_runs/{run_id}.jsonl
 ### 19.1 为什么保留 JSONL
 
 虽然业务数据进入数据库，但 JSONL 很适合保存 Agent 执行过程。
+
+JSONL 应使用追加写入：
+
+```text
+open file in append mode
+write one JSON object per line
+fsync or buffered flush based on performance setting
+never rewrite previous lines during normal run
+```
 
 每行是一个事件：
 
@@ -2288,18 +2585,25 @@ object_storage_ref
 MVP：
 
 - 网易邮箱 IMAP。
-- QQ 邮箱 IMAP。
-- Gmail IMAP 或 Gmail API。
 
 长期：
 
+- QQ 邮箱 IMAP。
+- Gmail IMAP 或 Gmail API。
 - Outlook Graph API。
 - 企业邮箱。
 - 自定义 IMAP。
 
 ### 20.2 日历
 
-MVP 可以先做内部日历。
+MVP 只做内部日历，不接飞书、Google Calendar 或 Outlook Calendar。
+
+内部日历形态：
+
+- MySQL 中的 `extracted_events` 是事实源。
+- 前端展示内部日历视图。
+- 可选导出或维护本地 `internal_calendar.ics` / `internal_calendar.json` 文件。
+- 新邮件产生新会议时，通过 `calendar_file.upsert_event` 更新已有本地日历文件。
 
 后续接入：
 
@@ -2321,6 +2625,8 @@ MVP 可以先做内部日历。
 ## 21. 前端界面设计
 
 ### 21.1 主要页面
+
+第一版需要前端，但目标是基础可用，不追求复杂视觉设计。页面应能支撑个人使用闭环。
 
 ```text
 Dashboard:
@@ -2357,7 +2663,7 @@ Agent Runs:
 - 证据片段。
 - 置信度。
 - 冲突信息。
-- 将要执行的外部动作。
+- 将要确认的动作。
 
 用户操作：
 
@@ -2374,9 +2680,11 @@ Agent Runs:
 docker-compose
   api-server
   worker
-  postgres
+  mysql
   redis
-  minio optional
+  rabbitmq
+  chroma
+  local file storage mounted volume
 ```
 
 ### 22.2 生产部署
@@ -2384,10 +2692,11 @@ docker-compose
 ```text
 API Server: 多实例
 Workers: 独立扩容
-PostgreSQL: 托管数据库
+MySQL: 托管数据库
 Redis: 托管 Redis
-Object Storage: S3 / OSS / MinIO
-LLM Provider: 可配置
+RabbitMQ: 托管消息队列
+Object Storage: S3 / OSS / MinIO，用于替代本地文件存储
+LLM Provider: 阿里百炼 Qwen，后续可抽象为可插拔 provider
 Secrets: KMS / Vault
 Observability: OpenTelemetry + Metrics
 ```
@@ -2446,17 +2755,18 @@ Observability: OpenTelemetry + Metrics
 - Memory Manager。
 - Source reference。
 
-### 23.6 Phase 6：外部系统写入
+### 23.6 Phase 6：本地日历文件与后续外部写入
 
-- 外部日历接入。
+- 本地日历文件导出和更新。
 - Pending Action。
 - 权限确认。
 - 幂等写入。
+- 外部日历接入作为后续版本。
 
 ### 23.7 Phase 7：搜索与评测
 
-- PostgreSQL Full Text Search。
-- pgvector。
+- MySQL Full Text Search。
+- Chroma 语义检索。
 - 离线评测集。
 - Prompt 版本对比。
 
@@ -2535,7 +2845,8 @@ Observability: OpenTelemetry + Metrics
 
 - dedupe_key。
 - idempotency key。
-- external_event_id 唯一约束。
+- 内部 event_id / calendar file UID 唯一约束。
+- 后续接入外部日历时，再增加 external_event_id 唯一约束。
 - supersedes_event_id 记录更新关系。
 
 ## 25. 与 Claude Code 架构的对应借鉴
@@ -2588,38 +2899,55 @@ Memory:
 如果要尽快开始实现，建议最小架构如下：
 
 ```text
-Next.js / React Frontend
+React / Next.js Frontend
         |
         v
-Fastify / NestJS API
+FastAPI
         |
-        +-- PostgreSQL
+        +-- MySQL
         +-- Redis
-        +-- BullMQ
+        +-- RabbitMQ
+        +-- Chroma
         +-- Local File Storage
-        +-- LLM Provider
+        +-- 阿里百炼 Qwen
         |
         v
-Workers
-        +-- sync_mailbox
+Python Workers
+        +-- sync_netease_mailbox
         +-- parse_email
         +-- classify_email
         +-- extract_event
+        +-- extract_task
         +-- detect_conflict
+        +-- memory_extract
 ```
 
-第一版只接一个邮箱 provider，例如网易邮箱或 QQ 邮箱，把闭环跑通后再扩展 Gmail 和 Outlook。
+第一版只接网易邮箱，把闭环跑通后再扩展 QQ 邮箱、Gmail 和 Outlook。
 
-## 27. 当前需要进一步确认的问题
+## 27. 已确认决策与待细化问题
 
-后续进入详细设计前，需要确认：
+以下是当前已经确认的 MVP 决策：
 
-- 后端使用 TypeScript 还是 Python。
-- 第一版接入哪个邮箱 provider。
-- 第一版是否需要前端，还是先做 API + CLI。
-- 第一版日历是内部日历，还是直接接飞书 / Google Calendar。
-- LLM provider 使用哪一个。
-- 是否要求本地优先隐私部署。
-- 邮件原文是否完整保存，保存多久。
-- MVP 用户规模是个人使用、团队内部，还是外部 SaaS。
+- 后端使用 Python。
+- API Framework 使用 FastAPI。
+- 队列使用 RabbitMQ。
+- 缓存、锁和短期状态使用 Redis。
+- 数据库使用 MySQL。
+- 向量检索使用 Chroma。
+- LLM 使用阿里百炼平台的 Qwen。
+- 第一版接入网易邮箱 IMAP。
+- 第一版需要前端，但只要求基础功能可用。
+- 第一版只做内部日历，不接飞书、Google Calendar 或 Outlook Calendar。
+- 第一版本地正常部署即可。
+- 邮件原文在本系统完整保存 14 天。
+- 14 天后可以删除本系统本地原文、HTML、附件副本，但不能删除网易邮箱服务器上的邮件。
+- 第一版用户规模仅个人使用。
+- 后续可能扩展到多用户或 SaaS，需要在权限、加密、隔离、审计和运维上进一步加强。
 
+仍需后续细化的问题：
+
+- 网易邮箱同步频率，例如每 5 分钟、10 分钟或手动 + 定时结合。
+- 默认提醒策略，例如面试前 1 天、1 小时、15 分钟。
+- 内部日历文件格式优先使用 ICS 还是 JSON。
+- 前端第一版是否需要登录，还是本地单用户免登录。
+- Qwen 调用的具体模型、最大 token、成本预算和限流策略。
