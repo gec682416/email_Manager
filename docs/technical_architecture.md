@@ -128,7 +128,7 @@ Agent Orchestrator
       |                       +-- Memory Tools
       |
       v
-Queue / Scheduler
+Queue / Manual Triggers
       |
       v
 Workers
@@ -196,6 +196,59 @@ MVP 必要：
 - 本地文件存储：MVP 保存 14 天原始邮件、HTML、附件和 JSONL 日志。
 - 阿里百炼 Qwen：邮件分类、事件抽取、摘要、对话推理。
 - 结构化日志：排查 agent 决策与工具执行问题。
+
+Qwen 默认调用策略：
+
+```text
+批量邮件分类:
+  默认使用 qwen3.5-flash 或 qwen-flash。
+  目标是低成本、高吞吐。
+
+事件 / 任务抽取:
+  默认使用 qwen3.5-flash。
+  对低置信度、时间复杂、线程改期类邮件升级到 qwen3.5-plus。
+
+主 Agent 问答:
+  默认使用 qwen3.5-plus。
+  目标是回答质量、工具选择和上下文理解更稳。
+
+疑难兜底:
+  qwen3-max 只用于人工触发的疑难复核，不进入默认后台流水线。
+```
+
+默认 token 与限流策略：
+
+```text
+email.classify:
+  max_input_tokens: 4K
+  max_output_tokens: 512
+
+event.extract / task.extract:
+  max_input_tokens: 8K
+  max_output_tokens: 1K
+
+agent.query:
+  max_input_tokens: 16K
+  max_output_tokens: 2K
+
+memory.extract:
+  max_input_tokens: 8K
+  max_output_tokens: 1K
+```
+
+成本预算策略：
+
+- 第一版个人使用，先设置软预算，例如每天 5 元人民币或等值额度。
+- 达到 80% 预算时，后台分类降级为规则优先，只对高价值邮件调用 Qwen。
+- 达到 100% 预算时，暂停非紧急 LLM 任务，保留 IMAP 同步和本地查询。
+- 所有 LLM 调用记录 model、prompt_version、input_tokens、output_tokens、estimated_cost。
+
+限流策略：
+
+- RabbitMQ worker 控制并发，例如分类 worker 初始并发 2 到 4。
+- 对 Qwen API 增加全局 rate limiter。
+- 遇到 429 或限流错误时指数退避。
+- 后台任务可以延迟，用户交互查询优先级高于批量分类。
 
 后续增强：
 
@@ -443,8 +496,17 @@ Workers 负责执行后台异步任务。
 
 ### 6.1 后台邮件同步流程
 
+第一版网易邮箱同步策略：
+
 ```text
-Scheduler
+不做定时同步。
+仅手动同步: 用户点击前端“同步邮件”按钮后，后端才发起同步任务。
+查询不自动同步: 用户提问时只查询本地数据库已有数据，并提示最近一次同步时间。
+```
+
+```text
+User clicks sync button
+  -> API Server
   -> enqueue sync_mailbox(account_id)
   -> acquire mailbox lock
   -> connect IMAP
@@ -464,6 +526,93 @@ Scheduler
 - 同步失败应记录错误并重试。
 - 频控错误应指数退避。
 - 邮件入库需要幂等。
+- 用户查询时不自动触发 IMAP 同步，避免查询链路变慢和不可控。
+- 前端需要展示最近一次同步时间，便于用户判断数据是否新鲜。
+
+### 6.1.1 IMAP 拉取邮件后的后台处理步骤
+
+后台程序通过 IMAP 拿到邮件后，不是直接把邮件交给主 Agent，而是进入一条确定性的异步处理流水线。主 Agent 后续只查询这条流水线产出的结构化结果。
+
+完整处理链路：
+
+```text
+1. 拉取邮件 envelope / headers / UID
+   -> 获取 UID、Message-ID、Subject、From、To、Date、Flags 等元数据。
+
+2. 去重与幂等判断
+   -> 使用 mail_account_id + folder + imap_uid 判断是否已同步。
+   -> 使用 Message-ID 和 body_hash 辅助识别重复邮件。
+
+3. 保存原始数据
+   -> 保存邮件元数据到 email_messages。
+   -> 保存 raw MIME、HTML、text、附件到本地文件存储。
+   -> 设置 raw_retention_until = received_at + 14 天。
+
+4. MIME 与正文解析
+   -> 解析 text/plain。
+   -> 将 HTML 清洗成 clean_text。
+   -> 提取链接、发件人、收件人、附件列表。
+   -> 去掉 HTML 中脚本、样式、签名噪声和重复引用内容。
+
+5. 附件处理
+   -> 保存附件文件名、content_type、大小、sha256、storage_ref。
+   -> MVP 只做元数据保存。
+   -> 后续可对 PDF / DOCX / ICS 附件做文本抽取。
+
+6. 邮件线程归并
+   -> 根据 Message-ID、In-Reply-To、References 和规范化 subject 建立 thread。
+   -> 对同一线程后续邮件识别“更新、改期、取消”等语义。
+
+7. 规则预分类
+   -> 使用标题、发件人、关键词、链接类型快速识别明显类别。
+   -> 例如“面试”“笔试”“测评”“interview”“assessment”。
+
+8. Qwen 分类
+   -> 对需要语义判断的邮件调用 Qwen。
+   -> 写入 category、confidence、reason、evidence、prompt_version。
+   -> 分类 worker 可以并发处理多封邮件。
+
+9. 事件 / 任务抽取
+   -> interview / written_test / meeting_invite / deadline 触发事件抽取。
+   -> todo_request / hr_followup 触发任务抽取。
+   -> 抽取时间、地点、会议链接、公司、联系人、证据片段。
+
+10. 时间标准化
+   -> 使用 email_sent_at 作为“明天、下周三”等相对时间的 reference_time。
+   -> 结合用户默认时区 Asia/Singapore。
+   -> 时区不确定或字段缺失时标记 needs_review。
+
+11. 去重、更新与冲突检测
+   -> 使用 dedupe_key 判断是否重复事件。
+   -> 如果新邮件是改期或取消，设置 supersedes_event_id。
+   -> 与已有 draft / confirmed event 做时间冲突检测。
+
+12. 创建内部事件、任务和提醒
+   -> 写入 extracted_events、tasks、event_conflicts。
+   -> 对有效时间事件创建默认提醒：事件开始前 1 天。
+   -> 需要人工确认的事件进入 needs_review。
+
+13. 更新内部日历文件
+   -> MySQL 中 extracted_events 是事实源。
+   -> 如果启用 ICS 导出，则通过 calendar_file.upsert_event 更新 internal_calendar.ics。
+
+14. 生成搜索索引
+   -> 关键词字段进入 MySQL 索引。
+   -> 需要语义检索的摘要、事件、memory 写入 Chroma embedding。
+
+15. 记录日志与状态
+   -> agent_runs / tool_calls 记录后台处理概要。
+   -> JSONL 用 append-only 记录处理事件。
+   -> 失败任务进入重试或死信队列。
+```
+
+这条流水线的核心原则：
+
+- IMAP 同步只读网易邮箱，不删除、不移动、不标记服务器邮件。
+- 邮件原文先入本地存储，后续处理都基于本地副本。
+- 分类、抽取、embedding 可以异步并发。
+- 写同步游标、写日历文件、更新同一事件必须串行或加锁。
+- 主 Agent 用户问答阶段不重新解析所有邮件，而是查询已结构化的数据。
 
 ### 6.2 邮件解析流程
 
@@ -604,7 +753,7 @@ updated_event: 疑似同一事件更新
 API Server
   -> Agent Orchestrator
   -> check last sync time
-  -> if stale, enqueue quick sync or offer refresh
+  -> if stale, tell user the latest local sync time and suggest clicking sync
   -> query classified emails / structured events from DB
   -> retrieve related email snippets
   -> build compact context
@@ -618,7 +767,7 @@ API Server
 - 优先查结构化事件表。
 - 不应直接把所有邮件塞给模型。
 - 主 Agent 默认只调用查询类工具，例如按类别、时间范围、状态获取邮件或事件。
-- 如果最近同步时间太旧，可以先提示“最近同步于 xx，是否刷新”或后台触发快速同步。
+- 如果最近同步时间太旧，只提示“最近同步于 xx，请点击同步按钮获取最新邮件”，不自动触发 IMAP 同步。
 
 ### 6.7 用户确认内部日历事件流程
 
@@ -1921,6 +2070,21 @@ conflict
 review
 ```
 
+默认提醒策略：
+
+```text
+event_type = interview / written_test / meeting:
+  默认在 start_time 前 1 天生成提醒。
+
+deadline:
+  默认在 due_at 前 1 天生成提醒。
+
+needs_review:
+  如果事件时间不完整或置信度低，立即生成 review 提醒。
+```
+
+第一版只做“前一天提醒”。后续可以增加 1 小时、15 分钟、多渠道提醒和用户自定义规则。
+
 ### 11.13 calendar_accounts
 
 该表用于后续外部日历接入，MVP 内部日历不依赖它。
@@ -2295,6 +2459,30 @@ deadline: 无 end_time
 ```text
 inferred_fields_json
 ```
+
+### 14.4 内部日历文件格式
+
+第一版内部日历文件优先使用 ICS：
+
+```text
+data/calendars/internal_calendar.ics
+```
+
+选择 ICS 的原因：
+
+- ICS 是通用日历交换格式。
+- 后续可以被 Apple Calendar、Google Calendar、Outlook 等工具导入或订阅。
+- 适合表达 VEVENT、开始时间、结束时间、地点、描述、提醒等信息。
+
+设计约束：
+
+- MySQL 中的 `extracted_events` 仍然是事实源。
+- ICS 文件只是导出视图或本地日历文件，不作为业务主存储。
+- 每个事件的 ICS UID 使用内部 `event_id`，保证重复写入时更新而不是新增。
+- 更新 ICS 文件必须按文件路径加锁，并使用原子写入。
+- 如果 ICS 更新失败，不能影响 MySQL 中事件状态。
+
+JSON 可以作为调试或前端缓存格式，但不是第一版优先日历格式。
 
 ## 15. 去重与更新设计
 
@@ -2937,17 +3125,61 @@ Python Workers
 - LLM 使用阿里百炼平台的 Qwen。
 - 第一版接入网易邮箱 IMAP。
 - 第一版需要前端，但只要求基础功能可用。
+- 第一版前端本地单用户免登录。
 - 第一版只做内部日历，不接飞书、Google Calendar 或 Outlook Calendar。
+- 内部日历文件格式优先使用 ICS。
 - 第一版本地正常部署即可。
 - 邮件原文在本系统完整保存 14 天。
 - 14 天后可以删除本系统本地原文、HTML、附件副本，但不能删除网易邮箱服务器上的邮件。
+- 网易邮箱不做定时同步，只在用户点击前端“同步邮件”按钮时发起同步。
+- 默认提醒策略为事件开始前 1 天提醒。
+- Qwen 默认采用分层模型策略：Flash 处理批量分类，Plus 处理主 Agent 问答和复杂抽取，Max 只做疑难兜底。
 - 第一版用户规模仅个人使用。
 - 后续可能扩展到多用户或 SaaS，需要在权限、加密、隔离、审计和运维上进一步加强。
 
 仍需后续细化的问题：
 
-- 网易邮箱同步频率，例如每 5 分钟、10 分钟或手动 + 定时结合。
-- 默认提醒策略，例如面试前 1 天、1 小时、15 分钟。
-- 内部日历文件格式优先使用 ICS 还是 JSON。
-- 前端第一版是否需要登录，还是本地单用户免登录。
-- Qwen 调用的具体模型、最大 token、成本预算和限流策略。
+- 前端第一版的具体页面布局和操作流。
+- 是否需要为本地单用户模式增加一个简单的本机访问 token，防止局域网误访问。
+- Qwen 具体模型名需要以实际开通的百炼地域和账号权限为准，例如 qwen3.5-flash / qwen-flash / qwen3.5-plus。
+- 每日成本软预算的具体金额。
+- 手动同步时是否允许用户选择同步范围，例如最近 7 天、最近 30 天或全量首次同步。
+
+## 27. 当前 V1 实现状态
+
+截至当前代码版本，第一版产品闭环已经实现以下能力：
+
+- 网易邮箱 IMAP 接入，使用客户端授权码登录。
+- 手动同步邮件，不做后台定时同步。
+- IMAP 同步只读服务器邮件，使用 `BODY.PEEK[]`，不删除、不移动、不标记服务器邮件。
+- 使用 UID 做增量同步，邮件入库具备幂等判断。
+- 本地保存 raw MIME、HTML、clean text，并设置 14 天 `raw_retention_until`。
+- 支持删除本系统本地邮件副本，语义明确为不删除网易邮箱服务器邮件。
+- 支持手动清理超过保留期的本地邮件原文副本。
+- 邮件解析、正文清洗、链接抽取、发件人和收件人解析。
+- 规则分类 + Qwen 分类兜底。
+- 规则事件/任务抽取 + Qwen 抽取兜底。
+- 事件、任务、提醒写入数据库。
+- 事件开始前 1 天提醒。
+- 任务截止前 1 天提醒。
+- 信息不完整事件生成 review 提醒。
+- 事件冲突检测，支持 `hard_overlap` 和 `ambiguous_time`。
+- 冲突记录入库并在前端展示。
+- 内部日历以 `extracted_events` 为事实源。
+- 生成并导出 ICS 文件。
+- 前端展示 Dashboard、统一邮件列表、邮件详情、内部日历、待办、提醒、冲突、事件复核、Agent 查询。
+- 用户可以确认、忽略、编辑内部事件。
+- Agent 使用受控工具查询邮件、日程、任务、冲突、当前时间、日历文件和长期 memory。
+- 未配置 Qwen API Key 时，Agent 自动降级为规则查询。
+- Agent Run 以 JSONL append-only 方式记录，并提供前端查看入口。
+
+当前 V1 为了保证本地个人可运行，实际代码采用以下简化：
+
+- 默认数据库使用 SQLite；Docker Compose 中保留 MySQL 作为后续切换路径。
+- RabbitMQ、Redis、Chroma 已在架构和部署中预留，但当前本地 MVP 的核心同步和处理链路先在 API 进程内执行。
+- 邮件分类和抽取已经按单封邮件幂等处理，但尚未拆成独立 RabbitMQ worker。
+- 语义检索尚未接入 Chroma，当前使用数据库结构化查询和 LIKE 检索。
+- 权限控制当前以 API 和工具白名单实现，没有单独拆出 Permission Manager 服务。
+- 用户登录不在第一版本地单用户范围内。
+
+这些简化不改变第一版产品闭环。后续如果要扩展到多邮箱、多用户或常驻后台处理，应优先把同步、分类、抽取、冲突检测和 embedding 迁移到 RabbitMQ worker，并把 SQLite 切到 MySQL。

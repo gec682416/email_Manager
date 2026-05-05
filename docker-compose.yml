@@ -1,0 +1,68 @@
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: email_manager_root
+      MYSQL_DATABASE: email_manager
+      MYSQL_USER: email_manager
+      MYSQL_PASSWORD: email_manager
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
+  chroma:
+    image: chromadb/chroma:latest
+    ports:
+      - "8001:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+
+  backend:
+    build: ./backend
+    depends_on:
+      - mysql
+      - redis
+      - rabbitmq
+      - chroma
+    environment:
+      DATABASE_URL: mysql+pymysql://email_manager:email_manager@mysql:3306/email_manager?charset=utf8mb4
+      CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174,http://localhost:5175,http://127.0.0.1:5175
+      DEFAULT_TIMEZONE: Asia/Singapore
+      RAW_RETENTION_DAYS: 14
+      REMINDER_DAYS_BEFORE: 1
+      NETEASE_IMAP_HOST: imap.163.com
+      NETEASE_IMAP_PORT: 993
+      NETEASE_FOLDER: INBOX
+      QWEN_ENABLED: "true"
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+
+  frontend:
+    build: ./frontend
+    depends_on:
+      - backend
+    environment:
+      VITE_API_BASE: http://localhost:8000
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend/src:/app/src
+
+volumes:
+  mysql_data:
+  chroma_data:
